@@ -76,9 +76,24 @@ async function callAI(messages, maxTokens = 4000, systemPrompt = '') {
     throw new Error(`${provider} API ${res.status}: ${t.slice(0, 200)}`);
   }
   const j = await res.json();
-  if (provider === 'claude')  return j.content[0].text;
-  if (provider === 'gemini')  return j.candidates[0].content.parts[0].text;
-  return j.choices[0].message.content;
+
+  // Detect truncation
+  let truncated = false;
+  if (provider === 'claude') {
+    truncated = j.stop_reason === 'max_tokens';
+  } else if (provider === 'openai' || provider === 'deepseek') {
+    truncated = j.choices?.[0]?.finish_reason === 'length';
+  }
+  if (truncated) {
+    console.warn(`[architect] AI response truncated (hit max_tokens=${maxTokens}) — output may be incomplete`);
+  }
+
+  let text;
+  if (provider === 'claude')  text = j.content[0].text;
+  else if (provider === 'gemini')  text = j.candidates[0].content.parts[0].text;
+  else text = j.choices[0].message.content;
+
+  return { text, truncated };
 }
 
 function parseJSON(raw) {
@@ -358,7 +373,7 @@ Respond with ONLY this JSON (no markdown, no preamble):
   ]
 }`;
 
-  const raw = await callAI([{ role: 'user', content: prompt }], 2500, ARCHITECT_PERSONA);
+  const { text: raw } = await callAI([{ role: 'user', content: prompt }], 2500, ARCHITECT_PERSONA);
   return parseJSON(raw);
 }
 
@@ -449,157 +464,152 @@ Respond with ONLY this JSON:
   ]
 }`;
 
-  const raw = await callAI([{ role: 'user', content: prompt }], 2800, ARCHITECT_PERSONA);
+  const { text: raw } = await callAI([{ role: 'user', content: prompt }], 2800, ARCHITECT_PERSONA);
   return parseJSON(raw);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  PHASE 3 — Architecture Generation with Landscape Mapping
+//
+//  Split into TWO AI calls to avoid token truncation:
+//    Call 1 — Structured architecture: layers, gaps, integrations, risks, steps
+//    Call 2 — Mermaid diagram based on the architecture from Call 1
 // ═══════════════════════════════════════════════════════════════════════════════
-async function phase3Architecture(requirement, allQA, landscape) {
-  const ctx     = buildLandscapeContext(landscape);
-  const patterns = detectIntentPatterns(requirement);
 
+// Compact landscape context for Phase 3 — fewer items to save tokens
+function buildCompactLandscapeContext(landscape) {
+  const { byCategory, apps, appCount, vendorCount, totalTechFS } = landscape;
+  const lines = [
+    `=== EXISTING LANDSCAPE: ${vendorCount} vendors | ${appCount} apps | ${totalTechFS} tech items ===`,
+  ];
+
+  if (vendorCount > 0) {
+    for (const [cat, vs] of Object.entries(byCategory)) {
+      if (!vs.length) continue;
+      const names = vs.slice(0, 8).map(v => v.name).join(', ');
+      lines.push(`[${cat}]: ${names}${vs.length > 8 ? ` (+${vs.length - 8} more)` : ''}`);
+    }
+  }
+
+  const byType = {};
+  for (const a of apps) {
+    if (!byType[a.fs_type]) byType[a.fs_type] = [];
+    byType[a.fs_type].push(a);
+  }
+  for (const [type, items] of Object.entries(byType)) {
+    const names = items.slice(0, 10).map(a => a.name).join(', ');
+    lines.push(`[${type}]: ${names}${items.length > 10 ? ` (+${items.length - 10} more)` : ''}`);
+  }
+
+  return lines.join('\n');
+}
+
+async function phase3Architecture(requirement, allQA, landscape) {
+  const ctx     = buildCompactLandscapeContext(landscape);
+  const patterns = detectIntentPatterns(requirement);
   const answersText = allQA.map((qa, i) => `Q${i + 1}: ${qa.question}\nA: ${qa.answer}`).join('\n\n');
 
-  const prompt = `You are generating a complete enterprise solution architecture.
+  // ── CALL 1: Structured architecture (no diagram) ─────────────────────────
+  console.log('[architect] Phase 3 — Call 1: generating architecture structure...');
+
+  const structurePrompt = `You are generating a complete enterprise solution architecture.
 
 REQUIREMENT: "${requirement}"
+PATTERNS: ${patterns.join(', ')}
 
-DETECTED ARCHITECTURE PATTERNS: ${patterns.join(', ')}
-
-ALL GATHERED REQUIREMENTS (${allQA.length} questions answered):
+ALL REQUIREMENTS (${allQA.length} questions answered):
 ${answersText}
 
 ${ctx}
 
-TASK: Generate a complete, production-quality solution architecture.
+TASK: Generate the full architecture structure. Do NOT include a diagram — that comes separately.
 
-ARCHITECTURE GENERATION RULES:
+RULES:
+1. LANDSCAPE MAPPING: Match capabilities against existing vendors/apps. Mark 'existing' only if in landscape, 'recommended' for procurement, 'new' for custom-built.
+2. GAP ANALYSIS: For every missing capability, provide 3-4 named product recommendations with pros/cons/cost.
+3. INTEGRATION MAP: List every integration with protocol, direction, data flows.
+4. Include ALL 7 sections below. Do NOT skip any section.
 
-1. LANDSCAPE MAPPING (critical):
-   - Go through the landscape systematically — match EVERY needed capability against existing vendors/apps
-   - Mark as 'existing' ONLY if the specific vendor or product is actually in the landscape
-   - Mark as 'recommended' for products that should be procured (with specific product names)
-   - Mark as 'new' for custom-built components
-
-2. GAP ANALYSIS (mandatory):
-   - For every capability NOT covered by existing landscape, create a gap entry
-   - For each gap, provide 3-4 specific NAMED product recommendations (not categories)
-   - Include real market products: e.g. "Apache Kafka", "Confluent Cloud", "Azure Service Bus", "AWS MSK" — not just "message broker"
-   - Include integration effort estimate and rough cost indication
-
-3. MERMAID DIAGRAM QUALITY (this is the most important output):
-   - Use 'flowchart TD' syntax (most reliable rendering)
-   - Show ALL architectural layers as subgraphs: Presentation, API Gateway, Business Services, Integration/Messaging, Data, External/Vendor, Infrastructure
-   - Use different node shapes to distinguish component types:
-     * Rectangles [Component] for services/applications
-     * Cylinders [(Database)] for data stores
-     * Stadium shapes ([Queue]) or parallelograms for message queues/events
-     * Rounded rectangles (Component) for external services
-   - Style existing components in green, new/custom in blue, recommended/missing in orange
-   - Show data flows with labeled arrows: --> |REST API| or --> |Event Stream| or --> |Batch ETL|
-   - The diagram MUST be syntactically valid Mermaid that renders without errors
-   - Aim for a diagram with 15-30 nodes — detailed enough to be useful, not so complex it breaks
-
-4. INTEGRATION MAP:
-   - List every integration with: from, to, protocol (REST/GraphQL/Event/Batch/gRPC/IDoc/OData), direction, and what data flows
-
-5. NFR SUMMARY:
-   - Summarise the key NFR decisions from Phase 2 in the architecture
-
-CRITICAL: Output the COMPLETE JSON with ALL sections filled. Do NOT stop early.
-The response MUST include layers, gaps, integrations, risks, nextSteps, AND a mermaid diagram.
-Put the mermaid diagram LAST since it's the largest section — all structured data must come first.
-
-Respond with ONLY this JSON (absolutely no markdown outside the JSON):
+Respond with ONLY this JSON:
 {
-  "title": "<specific architecture title, not generic>",
-  "summary": "<3-4 sentence executive summary covering what is built, what is reused, what is missing, and the key architectural pattern>",
-  "architecturalPattern": "<primary pattern: e.g. Event-Driven Microservices, API-Led Integration, Lambda Architecture, CQRS with Event Sourcing, etc.>",
+  "title": "<specific architecture title>",
+  "summary": "<3-4 sentence executive summary: what is built, reused, missing, key pattern>",
+  "architecturalPattern": "<e.g. Event-Driven Microservices, CQRS with Event Sourcing>",
   "estimatedComplexity": "low | medium | high | very_high",
-  "estimatedDuration": "<e.g. 3-6 months MVP, 12 months full rollout>",
+  "estimatedDuration": "<e.g. 3-6 months MVP, 12 months full>",
   "nfrDecisions": {
-    "availability": "<SLA and resilience approach>",
-    "scalability": "<scaling strategy and expected capacity>",
-    "security": "<security and compliance approach>",
-    "integration": "<integration pattern and protocols>"
+    "availability": "<SLA and resilience>",
+    "scalability": "<scaling strategy>",
+    "security": "<security approach>",
+    "integration": "<integration pattern>"
   },
   "layers": [
     {
-      "name": "<layer name: Presentation | API Gateway | Business Services | Integration & Messaging | Data | External & Vendor | Infrastructure>",
+      "name": "<Presentation | API Gateway | Business Services | Integration & Messaging | Data | External & Vendor | Infrastructure>",
       "components": [
-        {
-          "name": "<component display name>",
-          "type": "existing | new | recommended",
-          "product": "<exact product/vendor name if existing or recommended>",
-          "category": "<technology category>",
-          "role": "<what this component does in the architecture, 1-2 sentences>",
-          "existsInLandscape": true,
-          "notes": "<optional: key design decision or constraint>"
-        }
+        { "name": "<display name>", "type": "existing | new | recommended", "product": "<vendor/product>", "category": "<tech category>", "role": "<1-2 sentences>", "notes": "<optional>" }
       ]
     }
   ],
   "gaps": [
     {
-      "capability": "<specific missing capability, e.g. 'Event Streaming / Message Broker'>",
-      "impact": "<what breaks without this capability>",
+      "capability": "<missing capability>",
+      "impact": "<what breaks without it>",
       "urgency": "critical | high | medium",
       "recommendations": [
-        {
-          "name": "<specific product name, e.g. 'Apache Kafka'>",
-          "vendor": "<vendor name>",
-          "why": "<why this fits THIS architecture specifically>",
-          "pros": ["<pro 1>", "<pro 2>"],
-          "cons": ["<con 1>"],
-          "estimatedCost": "<rough annual cost range>",
-          "integrationEffort": "low | medium | high",
-          "recommended": true
-        }
+        { "name": "<product>", "vendor": "<vendor>", "why": "<fit reason>", "pros": ["..."], "cons": ["..."], "estimatedCost": "<range>", "integrationEffort": "low | medium | high", "recommended": true }
       ]
     }
   ],
   "integrations": [
-    {
-      "from": "<source component>",
-      "to": "<target component>",
-      "protocol": "<REST | GraphQL | Event | Batch | gRPC | IDoc | OData | SOAP | MQ>",
-      "direction": "sync | async | batch",
-      "dataFlows": "<what data/events flow>",
-      "notes": "<key integration design decision>"
-    }
+    { "from": "<source>", "to": "<target>", "protocol": "<REST|GraphQL|Event|Batch|gRPC|IDoc|OData|MQ>", "direction": "sync | async | batch", "dataFlows": "<data>", "notes": "<decision>" }
   ],
   "risks": [
-    {
-      "risk": "<specific risk>",
-      "severity": "high | medium | low",
-      "mitigation": "<concrete mitigation strategy>"
-    }
+    { "risk": "<risk>", "severity": "high | medium | low", "mitigation": "<strategy>" }
   ],
   "nextSteps": [
-    {
-      "step": "<action>",
-      "owner": "<role: Enterprise Architect | Development Team | Infrastructure | Procurement | Security>",
-      "timeline": "<e.g. Week 1-2 | Month 1 | Q1>",
-      "effort": "<S | M | L | XL>"
-    }
-  ],
-  "mermaidDiagram": "<complete valid Mermaid flowchart TD diagram as a single escaped string — this is LAST because it is the largest field>"
+    { "step": "<action>", "owner": "<role>", "timeline": "<timeframe>", "effort": "S | M | L | XL" }
+  ]
 }`;
 
-  const raw = await callAI([{ role: 'user', content: prompt }], 16000, ARCHITECT_PERSONA);
-  const result = parseJSON(raw);
+  const { text: structureRaw, truncated: structTruncated } = await callAI(
+    [{ role: 'user', content: structurePrompt }], 8000, ARCHITECT_PERSONA
+  );
+  let result = parseJSON(structureRaw);
 
-  // Warn if critical sections are missing (likely truncation)
-  const missing = [];
-  if (!result.layers || !result.layers.length) missing.push('layers');
-  if (!result.gaps) missing.push('gaps');
-  if (!result.integrations) missing.push('integrations');
-  if (!result.risks) missing.push('risks');
-  if (!result.nextSteps) missing.push('nextSteps');
-  if (missing.length) {
-    console.warn(`[architect] Phase 3 response missing sections: ${missing.join(', ')} — response may have been truncated`);
+  // If truncated and missing critical sections, retry with just the missing parts
+  const requiredSections = ['layers', 'gaps', 'integrations', 'risks', 'nextSteps'];
+  const missingSections = requiredSections.filter(s => !result[s] || (Array.isArray(result[s]) && !result[s].length));
+
+  if (missingSections.length > 0 && structTruncated) {
+    console.warn(`[architect] Call 1 truncated — missing: ${missingSections.join(', ')}. Retrying missing sections...`);
+
+    const retryPrompt = `The previous architecture generation was truncated. Here is what was generated so far:
+${JSON.stringify(result, null, 2)}
+
+Generate ONLY the missing sections: ${missingSections.join(', ')}
+
+Context:
+REQUIREMENT: "${requirement}"
+${ctx}
+
+Respond with ONLY a JSON object containing the missing sections. Use the same schema as before.`;
+
+    try {
+      const { text: retryRaw } = await callAI(
+        [{ role: 'user', content: retryPrompt }], 6000, ARCHITECT_PERSONA
+      );
+      const retryResult = parseJSON(retryRaw);
+      // Merge missing sections
+      for (const section of missingSections) {
+        if (retryResult[section]) {
+          result[section] = retryResult[section];
+        }
+      }
+      console.log(`[architect] Retry recovered sections: ${Object.keys(retryResult).join(', ')}`);
+    } catch (e) {
+      console.warn(`[architect] Retry failed: ${e.message}`);
+    }
   }
 
   // Cross-reference components against actual landscape
@@ -621,6 +631,78 @@ Respond with ONLY this JSON (absolutely no markdown outside the JSON):
         }
       }
     }
+  }
+
+  // ── CALL 2: Mermaid diagram based on the architecture ─────────────────────
+  console.log('[architect] Phase 3 — Call 2: generating Mermaid diagram...');
+
+  const layerSummary = (result.layers || []).map(l => {
+    const comps = (l.components || []).map(c => `${c.name} (${c.type})`).join(', ');
+    return `${l.name}: ${comps}`;
+  }).join('\n');
+
+  const integrationSummary = (result.integrations || []).map(i =>
+    `${i.from} → ${i.to} [${i.protocol || 'API'}, ${i.direction || 'sync'}]`
+  ).join('\n');
+
+  const diagramPrompt = `Generate a Mermaid architecture diagram for this solution:
+
+Title: ${result.title}
+Pattern: ${result.architecturalPattern}
+
+LAYERS AND COMPONENTS:
+${layerSummary}
+
+INTEGRATIONS:
+${integrationSummary}
+
+RULES:
+- Use 'flowchart TD' syntax
+- Create a subgraph for each layer
+- Use node shapes: [Service] for apps, [(Database)] for data stores, ([Queue]) for messaging
+- Style existing components green, new blue, recommended orange using classDef
+- Label arrows with protocol/data: --> |REST API| or --> |Event|
+- 15-30 nodes max — detailed but renderable
+- Output ONLY the raw Mermaid code, no JSON wrapping, no markdown fences
+
+Example structure:
+flowchart TD
+  classDef existing fill:#e8f5e9,stroke:#4caf50,color:#2e7d32
+  classDef new fill:#e3f2fd,stroke:#2196f3,color:#1565c0
+  classDef recommended fill:#fff3e0,stroke:#ff9800,color:#e65100
+
+  subgraph Presentation
+    A[Web App]:::existing
+  end
+  subgraph Services
+    B[Order Service]:::new
+  end
+  A --> |REST| B`;
+
+  try {
+    const { text: diagramRaw } = await callAI(
+      [{ role: 'user', content: diagramPrompt }], 4000, ARCHITECT_PERSONA
+    );
+    // Extract raw Mermaid code (strip markdown fences if present)
+    let mermaid = diagramRaw.replace(/```mermaid\s*/g, '').replace(/```\s*/g, '').trim();
+    // Ensure it starts with flowchart
+    if (!mermaid.startsWith('flowchart') && !mermaid.startsWith('graph')) {
+      const idx = mermaid.indexOf('flowchart');
+      if (idx !== -1) mermaid = mermaid.slice(idx);
+    }
+    result.mermaidDiagram = mermaid;
+    console.log(`[architect] Diagram generated: ${mermaid.split('\n').length} lines`);
+  } catch (e) {
+    console.warn(`[architect] Diagram generation failed: ${e.message}`);
+    result.mermaidDiagram = null;
+  }
+
+  // Final completeness check
+  const finalMissing = requiredSections.filter(s => !result[s] || (Array.isArray(result[s]) && !result[s].length));
+  if (finalMissing.length) {
+    console.warn(`[architect] Phase 3 final result still missing: ${finalMissing.join(', ')}`);
+  } else {
+    console.log('[architect] Phase 3 complete — all sections present');
   }
 
   return result;
