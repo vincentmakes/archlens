@@ -139,40 +139,12 @@ function repairTruncatedJSON(text) {
 }
 
 // ── Landscape loader ──────────────────────────────────────────────────────────
+// Delegates to a DataProvider (SQLite or MCP) for the actual data fetch.
+const { createDataProvider } = require('./dataProvider');
+
 async function loadLandscape(workspace) {
-  const { getDB } = require('../db/db');
-  const db = getDB();
-
-  const vendors = await db.all(
-    `SELECT vendor_name, category, sub_category, app_count, total_cost, app_list
-     FROM vendor_analysis WHERE workspace = ? ORDER BY app_count DESC`,
-    [workspace]
-  ).catch(() => []);
-
-  const apps = await db.all(
-    `SELECT name, fs_type, description, lifecycle, vendors, tags, criticality, tech_fit, annual_cost
-     FROM fact_sheets
-     WHERE workspace = ? AND fs_type IN ('Application','ITComponent','Interface','Middleware','Microservice','Service')
-     ORDER BY fs_type, name`,
-    [workspace]
-  ).catch(() => []);
-
-  const appOnlyCount = apps.filter(a => ['Application','Microservice','Service'].includes(a.fs_type)).length;
-
-  const byCategory = {};
-  for (const v of vendors) {
-    const cat = v.category || 'Other';
-    if (!byCategory[cat]) byCategory[cat] = [];
-    byCategory[cat].push({
-      name:        v.vendor_name,
-      subCategory: v.sub_category,
-      appCount:    v.app_count,
-      cost:        v.total_cost,
-      apps: (() => { try { return JSON.parse(v.app_list || '[]'); } catch { return []; } })()
-    });
-  }
-
-  return { vendors, apps, byCategory, vendorCount: vendors.length, appCount: appOnlyCount, totalTechFS: apps.length };
+  const provider = createDataProvider(workspace);
+  return provider.loadArchitectLandscape();
 }
 
 // ── Landscape context builder — structured for the AI ────────────────────────
@@ -536,11 +508,17 @@ ARCHITECTURE GENERATION RULES:
 5. NFR SUMMARY:
    - Summarise the key NFR decisions from Phase 2 in the architecture
 
+CRITICAL: Output the COMPLETE JSON with ALL sections filled. Do NOT stop early.
+The response MUST include layers, gaps, integrations, risks, nextSteps, AND a mermaid diagram.
+Put the mermaid diagram LAST since it's the largest section — all structured data must come first.
+
 Respond with ONLY this JSON (absolutely no markdown outside the JSON):
 {
   "title": "<specific architecture title, not generic>",
   "summary": "<3-4 sentence executive summary covering what is built, what is reused, what is missing, and the key architectural pattern>",
   "architecturalPattern": "<primary pattern: e.g. Event-Driven Microservices, API-Led Integration, Lambda Architecture, CQRS with Event Sourcing, etc.>",
+  "estimatedComplexity": "low | medium | high | very_high",
+  "estimatedDuration": "<e.g. 3-6 months MVP, 12 months full rollout>",
   "nfrDecisions": {
     "availability": "<SLA and resilience approach>",
     "scalability": "<scaling strategy and expected capacity>",
@@ -558,7 +536,7 @@ Respond with ONLY this JSON (absolutely no markdown outside the JSON):
           "category": "<technology category>",
           "role": "<what this component does in the architecture, 1-2 sentences>",
           "existsInLandscape": true,
-          "notes": "<optional: key design decision or constraint for this component>"
+          "notes": "<optional: key design decision or constraint>"
         }
       ]
     }
@@ -592,7 +570,6 @@ Respond with ONLY this JSON (absolutely no markdown outside the JSON):
       "notes": "<key integration design decision>"
     }
   ],
-  "mermaidDiagram": "<complete valid Mermaid flowchart TD diagram as a single escaped string>",
   "risks": [
     {
       "risk": "<specific risk>",
@@ -608,12 +585,22 @@ Respond with ONLY this JSON (absolutely no markdown outside the JSON):
       "effort": "<S | M | L | XL>"
     }
   ],
-  "estimatedComplexity": "low | medium | high | very_high",
-  "estimatedDuration": "<e.g. 3-6 months MVP, 12 months full rollout>"
+  "mermaidDiagram": "<complete valid Mermaid flowchart TD diagram as a single escaped string — this is LAST because it is the largest field>"
 }`;
 
-  const raw = await callAI([{ role: 'user', content: prompt }], 8000, ARCHITECT_PERSONA);
+  const raw = await callAI([{ role: 'user', content: prompt }], 16000, ARCHITECT_PERSONA);
   const result = parseJSON(raw);
+
+  // Warn if critical sections are missing (likely truncation)
+  const missing = [];
+  if (!result.layers || !result.layers.length) missing.push('layers');
+  if (!result.gaps) missing.push('gaps');
+  if (!result.integrations) missing.push('integrations');
+  if (!result.risks) missing.push('risks');
+  if (!result.nextSteps) missing.push('nextSteps');
+  if (missing.length) {
+    console.warn(`[architect] Phase 3 response missing sections: ${missing.join(', ')} — response may have been truncated`);
+  }
 
   // Cross-reference components against actual landscape
   const { vendors, apps } = landscape;

@@ -270,31 +270,22 @@ Return ONLY a JSON object (no markdown):
 }
 
 // ── Main analysis ─────────────────────────────────────────────────────────────
+const { createDataProvider } = require('./dataProvider');
+
 async function analyseVendors(workspace, emit) {
   const _emit = typeof emit === "function" ? emit : () => {};
   const { getDB } = require('../db/db');
   const db = getDB();
 
-  // Source: ONLY Application + ITComponent (they carry the provider relations)
-  const rows = await db.all(
-    `SELECT id, name, fs_type, vendors, annual_cost
-     FROM fact_sheets
-     WHERE workspace = ?
-       AND fs_type IN ('Application', 'ITComponent')
-       AND vendors != '[]'
-       AND vendors IS NOT NULL`,
-    [workspace]
-  );
+  // Load card data via DataProvider (SQLite or MCP)
+  const provider = createDataProvider(workspace);
+  const { cards: rows, providerCount, providers: provRows } = await provider.getCardsWithVendors();
 
   if (!rows.length) {
-    const providerCount = await db.get(
-      `SELECT COUNT(*) as c FROM fact_sheets WHERE workspace = ? AND fs_type = 'Provider'`,
-      [workspace]
-    );
     return {
       analysed: 0,
       warning: `No vendor relationships found on Application or ITComponent fact sheets. ` +
-               `Found ${providerCount?.c || 0} Provider records. ` +
+               `Found ${providerCount} Provider records. ` +
                `Ensure Applications have relApplicationToProvider relations in LeanIX.`
     };
   }
@@ -316,20 +307,16 @@ async function analyseVendors(workspace, emit) {
       vendorMap[v].appDetails.push({
         name: row.name,
         type: row.fs_type,
-        description: (row.description || '').slice(0, 200), // Limit to 200 chars
+        description: (row.description || '').slice(0, 200),
         tags: row.tags
       });
     }
   }
 
   // Also include Provider fact sheets themselves (their name = the vendor product)
-  const provRows = await db.all(
-    `SELECT name, annual_cost, description FROM fact_sheets WHERE workspace = ? AND fs_type = 'Provider'`,
-    [workspace]
-  );
   for (const row of provRows) {
     const v = (row.name || '').trim();
-    if (!v || vendorMap[v]) continue; // skip if already found via relations
+    if (!v || vendorMap[v]) continue;
     vendorMap[v] = { apps: [], totalCost: parseFloat(row.annual_cost) || 0, appDetails: [], providerDescription: row.description };
   }
 

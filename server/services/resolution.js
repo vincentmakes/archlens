@@ -65,29 +65,22 @@ function safeJSON(raw) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  STEP 1 — Load full landscape context from DB
+//  STEP 1 — Load full landscape context via DataProvider
 // ══════════════════════════════════════════════════════════════════════════════
+const { createDataProvider } = require('./dataProvider');
+
 async function loadFullLandscape(workspace) {
+  const provider = createDataProvider(workspace);
+  const land = await provider.loadFullLandscape();
+
+  // vendor_analysis is always local (analysis output, not input data)
   const db = require('../db/db').getDB();
+  const vendorAnalysis = await db.all(
+    `SELECT vendor_name,category,sub_category,app_count,total_cost,app_list FROM vendor_analysis WHERE workspace=?`,
+    [workspace]
+  );
 
-  const [apps, itcs, ifaces, providers, vendorAnalysis] = await Promise.all([
-    db.all(`SELECT id,name,description,tags,vendors,lifecycle,criticality,tech_fit,annual_cost,quality_score,locker FROM fact_sheets WHERE workspace=? AND fs_type='Application'`, [workspace]),
-    db.all(`SELECT id,name,description,tags,vendors,lifecycle,tech_fit,annual_cost,quality_score,locker FROM fact_sheets WHERE workspace=? AND fs_type='ITComponent'`, [workspace]),
-    db.all(`SELECT id,name,description,tags,vendors,lifecycle FROM fact_sheets WHERE workspace=? AND fs_type='Interface'`, [workspace]),
-    db.all(`SELECT id,name,description,tags FROM fact_sheets WHERE workspace=? AND fs_type='Provider'`, [workspace]),
-    db.all(`SELECT vendor_name,category,sub_category,app_count,total_cost,app_list FROM vendor_analysis WHERE workspace=?`, [workspace]),
-  ]);
-
-  const parse = row => { try { return JSON.parse(row||'[]'); } catch { return []; } };
-
-  return {
-    apps:     apps.map(r => ({ ...r, tags:parse(r.tags), vendors:parse(r.vendors) })),
-    itcs:     itcs.map(r => ({ ...r, tags:parse(r.tags), vendors:parse(r.vendors) })),
-    ifaces:   ifaces.map(r => ({ ...r, tags:parse(r.tags), vendors:parse(r.vendors||'[]') })),
-    providers: providers.map(r => ({ ...r, tags:parse(r.tags) })),
-    vendorAnalysis,
-    counts: { apps:apps.length, itcs:itcs.length, ifaces:ifaces.length, providers:providers.length }
-  };
+  return { ...land, vendorAnalysis };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
