@@ -152,13 +152,11 @@ async function fetchStakeholders(host, token, cardId) {
 }
 
 // ── Fetch relations to extract vendor info ──────────────────────────────────
-async function fetchRelations(host, token, typeKey) {
+async function fetchRelations(host, token) {
   try {
-    const data = await apiGet(
-      host,
-      token,
-      `/api/v1/relations?source_type=${typeKey}&page_size=1000`,
-    );
+    // The relations API supports ?card_id and ?type filters only.
+    // Fetch all and filter in memory for Provider links.
+    const data = await apiGet(host, token, '/api/v1/relations');
     return data.items || data || [];
   } catch {
     return [];
@@ -237,7 +235,7 @@ function normalise(card, ownerMap, vendorMap) {
     ),
     vendors: JSON.stringify(vendors),
     criticality: attrs.businessCriticality || null,
-    tech_fit: attrs.technicalFit || null,
+    tech_fit: attrs.technicalSuitability || attrs.technicalFit || null,
     fs_level: null,
     annual_cost: attrs.costTotalAnnual || 0,
   };
@@ -325,15 +323,18 @@ async function syncWorkspace(baseUrl, email, password, options = {}, emit = () =
       // Try fetching Provider relations for relevant types
       if (['Application', 'ITComponent'].includes(ft.name)) {
         try {
-          const rels = await fetchRelations(host, token, ft.name);
+          const rels = await fetchRelations(host, token);
           for (const rel of rels) {
-            if (rel.target_type === 'Provider' || rel.source_type === 'Provider') {
+            // Turbo EA returns nested objects: rel.source.type, rel.target.type
+            const srcType = rel.source?.type || rel.source_type;
+            const tgtType = rel.target?.type || rel.target_type;
+            if (tgtType === 'Provider' || srcType === 'Provider') {
               const cardId =
-                rel.source_type === 'Provider' ? rel.target_id : rel.source_id;
+                srcType === 'Provider' ? rel.target_id : rel.source_id;
               const vendorName =
-                rel.source_type === 'Provider'
-                  ? rel.source_name
-                  : rel.target_name;
+                srcType === 'Provider'
+                  ? (rel.source?.name || rel.source_name)
+                  : (rel.target?.name || rel.target_name);
               if (vendorMap[cardId] && vendorName) {
                 vendorMap[cardId].push(vendorName);
               }
