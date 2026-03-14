@@ -1,9 +1,11 @@
 require('dotenv').config();
-const express  = require('express');
-const cors     = require('cors');
-const cron     = require('node-cron');
+const express   = require('express');
+const cors      = require('cors');
+const cron      = require('node-cron');
+const rateLimit = require('express-rate-limit');
 const { initDB, getDB }  = require('./db/db');
-const { syncWorkspace, getToken, discoverTypes, parseHost } = require('./services/leanix');
+const { syncWorkspace: leanixSync, getToken: leanixGetToken, discoverTypes: leanixDiscoverTypes, parseHost } = require('./services/leanix');
+const { syncWorkspace: turboSync, getToken: turboGetToken, discoverTypes: turboDiscoverTypes, parseUrl: parseTurboUrl } = require('./services/turboea');
 const { analyseVendors, getAIConfig } = require('./services/ai');
 const { phase1Questions, phase2Questions, phase3Architecture, loadLandscape } = require('./services/architect');
 const { resolveVendorIdentities, detectDuplicates, assessModernization, loadFullLandscape } = require('./services/resolution');
@@ -86,16 +88,41 @@ app.get('/api/connect/saved', async (req, res) => {
 //  CONNECT
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/api/connect', async (req, res) => {
-  const { workspace, apiKey } = req.body || {};
+  const { workspace, apiKey, source_type, email, password } = req.body || {};
+
+  // Turbo EA source: uses email/password auth
+  if (source_type === 'turboea') {
+    const url = workspace;
+    if (!url || !email || !password) {
+      return res.status(400).json({ error: 'workspace (URL), email, and password are required for Turbo EA' });
+    }
+    try {
+      const { token, host } = await turboGetToken(url, email, password);
+      const types = await turboDiscoverTypes(host, token);
+      const db = getDB();
+      const hostKey = parseTurboUrl(url);
+      await db.run(`INSERT OR IGNORE INTO workspaces (host, api_key, source_type) VALUES (?, ?, ?)`, [hostKey, `turboea:${email}`, 'turboea']);
+      await db.run(`UPDATE workspaces SET api_key = ?, source_type = ? WHERE host = ?`, [`turboea:${email}`, 'turboea', hostKey]);
+      res.json({
+        ok: true, host: hostKey, types, source_type: 'turboea',
+        total: types.filter(t => t.count > 0).reduce((s, t) => s + t.count, 0)
+      });
+    } catch (err) {
+      res.status(401).json({ error: err.message });
+    }
+    return;
+  }
+
+  // Default: LeanIX source
   if (!workspace || !apiKey) return res.status(400).json({ error: 'workspace and apiKey are required' });
   try {
-    const { token, host } = await getToken(workspace, apiKey);
-    const types = await discoverTypes(host, token);
+    const { token, host } = await leanixGetToken(workspace, apiKey);
+    const types = await leanixDiscoverTypes(host, token);
     const db = getDB();
     await db.run(`INSERT OR IGNORE INTO workspaces (host, api_key) VALUES (?, ?)`, [host, apiKey]);
     await db.run(`UPDATE workspaces SET api_key = ? WHERE host = ?`, [apiKey, host]);
     res.json({
-      ok: true, host, types,
+      ok: true, host, types, source_type: 'leanix',
       total: types.filter(t => t.count > 0).reduce((s, t) => s + t.count, 0)
     });
   } catch (err) {
@@ -105,10 +132,45 @@ app.post('/api/connect', async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  SYNC — Server-Sent Events live stream
+//  POST accepts credentials in body (preferred); GET kept for backward compat.
 // ═══════════════════════════════════════════════════════════════════════════════
-app.get('/api/sync/stream', async (req, res) => {
-  const { workspace, apiKey, fsTypes = 'all' } = req.query;
-  if (!workspace || !apiKey) return res.status(400).json({ error: 'workspace and apiKey required' });
+function extractSyncParams(req) {
+  if (req.method === 'POST') {
+    // POST: credentials in body, non-sensitive params can be in query or body
+    const merged = { ...req.query, ...req.body };
+    return {
+      workspace:   merged.workspace,
+      apiKey:      merged.apiKey,
+      fsTypes:     merged.fsTypes || 'all',
+      source_type: merged.source_type,
+      email:       merged.email,
+      password:    merged.password,
+    };
+  }
+  // GET: only allow non-sensitive params (workspace, fsTypes) from query string.
+  // Credentials (apiKey, email, password) are NOT read from query params.
+  return {
+    workspace:   req.query.workspace,
+    apiKey:      undefined,
+    fsTypes:     req.query.fsTypes || 'all',
+    source_type: undefined,
+    email:       undefined,
+    password:    undefined,
+  };
+}
+
+async function handleSyncStream(req, res) {
+  const { workspace, apiKey, fsTypes, source_type, email, password } = extractSyncParams(req);
+  if (!workspace) return res.status(400).json({ error: 'workspace required' });
+
+  // GET requests cannot carry credentials — require POST for authenticated sync
+  if (req.method === 'GET' && !apiKey) {
+    // Legacy GET path: look up stored API key from database for LeanIX compat
+    const db = getDB();
+    const row = await db.get('SELECT api_key, source_type FROM workspaces WHERE host = ?', [parseHost(workspace)]);
+    if (!row || !row.api_key) return res.status(400).json({ error: 'Use POST with credentials in body' });
+  }
+  if (source_type !== 'turboea' && !apiKey) return res.status(400).json({ error: 'apiKey required for LeanIX sync — use POST with credentials in body' });
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -132,7 +194,13 @@ app.get('/api/sync/stream', async (req, res) => {
   } catch { jobId = null; }
 
   try {
-    const { results, allTypes, host } = await syncWorkspace(workspace, apiKey, { fsTypes }, send);
+    let syncResult;
+    if (source_type === 'turboea') {
+      syncResult = await turboSync(workspace, email, password, { fsTypes }, send);
+    } else {
+      syncResult = await leanixSync(workspace, apiKey, { fsTypes }, send);
+    }
+    const { results, allTypes, host } = syncResult;
 
     send({ event: 'saving', msg: 'Persisting to database…' });
     let saved = 0;
@@ -162,7 +230,11 @@ app.get('/api/sync/stream', async (req, res) => {
     send({ event: 'error', msg: err.message });
   }
   res.end();
-});
+}
+
+// GET kept for backward compatibility (LeanIX); POST preferred for Turbo EA
+app.get('/api/sync/stream', handleSyncStream);
+app.post('/api/sync/stream', handleSyncStream);
 
 // Sync job history
 app.get('/api/sync/jobs', async (req, res) => {
@@ -692,8 +764,18 @@ if (process.env.NODE_ENV === 'production') {
   const path = require('path');
   const buildPath = path.join(__dirname, '..', 'client', 'build');
   app.use(express.static(buildPath, { maxAge: '1y', etag: true }));
+
+  // Rate-limiting middleware for SPA fallback (100 req/min per IP)
+  const spaLimiter = rateLimit({
+    windowMs: 60_000,
+    max: 100,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests' },
+  });
+
   // SPA fallback — any non-API route returns index.html
-  app.get('*', (req, res) => {
+  app.get('*', spaLimiter, (req, res) => {
     if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'Not found' });
     res.sendFile(path.join(buildPath, 'index.html'));
   });
