@@ -634,7 +634,13 @@ app.get('/api/duplicates', async (req, res) => {
     `SELECT * FROM duplicate_clusters WHERE workspace=? ORDER BY id DESC`,
     [req.query.workspace || '']
   ).catch(() => []);
-  res.json(rows);
+  // fs_ids and fs_names are stored as JSON strings in SQLite — parse them
+  const parsed = rows.map(r => ({
+    ...r,
+    fs_ids: typeof r.fs_ids === 'string' ? JSON.parse(r.fs_ids || '[]') : (r.fs_ids || []),
+    fs_names: typeof r.fs_names === 'string' ? JSON.parse(r.fs_names || '[]') : (r.fs_names || []),
+  }));
+  res.json(parsed);
 });
 
 app.put('/api/duplicates/:id/status', async (req, res) => {
