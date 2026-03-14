@@ -83,10 +83,59 @@ async function callAI(messages, maxTokens = 4000, systemPrompt = '') {
 
 function parseJSON(raw) {
   const text = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+  // 1. Direct parse
   try { return JSON.parse(text); } catch (_) {}
+  // 2. Regex-extract the outermost JSON object/array
   const match = text.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
   if (match) { try { return JSON.parse(match[1]); } catch (_) {} }
+  // 3. Try to repair truncated JSON (LLM hit token limit mid-response)
+  const repaired = repairTruncatedJSON(text);
+  if (repaired) { try { return JSON.parse(repaired); } catch (_) {} }
   throw new Error('Could not parse AI response as JSON. Raw: ' + text.slice(0, 300));
+}
+
+/**
+ * Attempt to repair truncated JSON by closing open brackets/braces and
+ * removing trailing incomplete values (e.g. a string that was never closed).
+ */
+function repairTruncatedJSON(text) {
+  // Find the first { or [ to start from
+  const startObj = text.indexOf('{');
+  const startArr = text.indexOf('[');
+  if (startObj === -1 && startArr === -1) return null;
+  const start = startObj === -1 ? startArr : startArr === -1 ? startObj : Math.min(startObj, startArr);
+  let json = text.slice(start);
+
+  // Remove any trailing incomplete string value (unmatched quote)
+  // Count unescaped quotes — if odd, the last string was truncated
+  const quoteCount = (json.match(/(?<!\\)"/g) || []).length;
+  if (quoteCount % 2 !== 0) {
+    // Find the last unescaped quote and truncate after it, closing the string
+    const lastQuote = json.lastIndexOf('"');
+    json = json.slice(0, lastQuote + 1);
+  }
+
+  // Remove trailing comma or colon (incomplete key-value)
+  json = json.replace(/[,:\s]+$/, '');
+
+  // Count open vs close brackets and close them
+  const opens = [];
+  let inString = false;
+  let escape = false;
+  for (const ch of json) {
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{' || ch === '[') opens.push(ch);
+    if (ch === '}' || ch === ']') opens.pop();
+  }
+  // Close remaining open brackets in reverse order
+  while (opens.length > 0) {
+    const open = opens.pop();
+    json += open === '{' ? '}' : ']';
+  }
+  return json;
 }
 
 // ── Landscape loader ──────────────────────────────────────────────────────────
@@ -563,7 +612,7 @@ Respond with ONLY this JSON (absolutely no markdown outside the JSON):
   "estimatedDuration": "<e.g. 3-6 months MVP, 12 months full rollout>"
 }`;
 
-  const raw = await callAI([{ role: 'user', content: prompt }], 5000, ARCHITECT_PERSONA);
+  const raw = await callAI([{ role: 'user', content: prompt }], 8000, ARCHITECT_PERSONA);
   const result = parseJSON(raw);
 
   // Cross-reference components against actual landscape
