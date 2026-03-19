@@ -88,11 +88,12 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS workspaces (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  host       TEXT    UNIQUE NOT NULL,
-  api_key    TEXT    NOT NULL,
-  last_sync  TEXT,
-  created_at TEXT    DEFAULT (datetime('now'))
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  host        TEXT    UNIQUE NOT NULL,
+  api_key     TEXT    NOT NULL,
+  source_type TEXT    DEFAULT 'leanix',
+  last_sync   TEXT,
+  created_at  TEXT    DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS fact_sheets (
   id            TEXT NOT NULL,
@@ -241,6 +242,13 @@ async function initDB(overrideCfg) {
   }
 
   await _db.exec(SCHEMA);
+
+  // Migrate: add source_type column if missing (existing DBs pre-date this column)
+  try {
+    await _db.run("ALTER TABLE workspaces ADD COLUMN source_type TEXT DEFAULT 'leanix'");
+    console.log('[DB] Migrated: added workspaces.source_type');
+  } catch (_) { /* column already exists */ }
+
   console.log('[DB] Schema ready');
   return _db;
 }
